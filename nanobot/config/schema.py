@@ -192,10 +192,25 @@ class AgentDefaults(Base):
     memory_window: int = 100
 
 
+class AgentConfig(Base):
+    """Per-agent configuration for swarm mode."""
+
+    name: str = ""
+    model: str = ""                    # empty → use defaults.model
+    workspace: str = ""                # empty → ~/.nanobot/agents/{name}
+    max_tokens: int = 0                # 0 → use defaults
+    temperature: float = -1.0          # -1 → use defaults
+    max_tool_iterations: int = 0       # 0 → use defaults
+    memory_window: int = 0             # 0 → use defaults
+    channels: list[str] = Field(default_factory=list)  # ["telegram", "slack:C123"]
+    description: str = ""              # shown to peer agents via AGENTS.md
+
+
 class AgentsConfig(Base):
     """Agent configuration."""
 
     defaults: AgentDefaults = Field(default_factory=AgentDefaults)
+    instances: list[AgentConfig] = Field(default_factory=list)
 
 
 class ProviderConfig(Base):

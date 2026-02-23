@@ -292,35 +292,55 @@ def gateway(
         logging.basicConfig(level=logging.DEBUG)
     
     console.print(f"{__logo__} Starting nanobot gateway on port {port}...")
-    
+
     config = load_config()
     bus = MessageBus()
     provider = _make_provider(config)
     session_manager = SessionManager(config.workspace_path)
-    
+
     # Create cron service first (callback set after agent creation)
     cron_store_path = get_data_dir() / "cron" / "jobs.json"
     cron = CronService(cron_store_path)
-    
-    # Create agent with cron service
-    agent = AgentLoop(
-        bus=bus,
-        provider=provider,
-        workspace=config.workspace_path,
-        model=config.agents.defaults.model,
-        temperature=config.agents.defaults.temperature,
-        max_tokens=config.agents.defaults.max_tokens,
-        max_iterations=config.agents.defaults.max_tool_iterations,
-        memory_window=config.agents.defaults.memory_window,
-        brave_api_key=config.tools.web.search.api_key or None,
-        exec_config=config.tools.exec,
-        cron_service=cron,
-        restrict_to_workspace=config.tools.restrict_to_workspace,
-        session_manager=session_manager,
-        mcp_servers=config.tools.mcp_servers,
-        channels_config=config.channels,
-    )
-    
+
+    # Decide: swarm mode vs single-agent mode
+    swarm_mode = bool(config.agents.instances)
+    swarm = None
+
+    if swarm_mode:
+        from nanobot.agent.swarm import SwarmManager
+        swarm = SwarmManager(
+            config=config,
+            shared_bus=bus,
+            provider=provider,
+            cron_service=cron,
+            mcp_servers=config.tools.mcp_servers,
+        )
+        # In swarm mode, the "primary" agent is the swarm's default agent
+        agent = swarm.default_agent
+        console.print(
+            f"[green]✓[/green] Swarm mode: {len(swarm.agent_names)} agents "
+            f"({', '.join(swarm.agent_names)})"
+        )
+    else:
+        # Single-agent mode (original path, unchanged)
+        agent = AgentLoop(
+            bus=bus,
+            provider=provider,
+            workspace=config.workspace_path,
+            model=config.agents.defaults.model,
+            temperature=config.agents.defaults.temperature,
+            max_tokens=config.agents.defaults.max_tokens,
+            max_iterations=config.agents.defaults.max_tool_iterations,
+            memory_window=config.agents.defaults.memory_window,
+            brave_api_key=config.tools.web.search.api_key or None,
+            exec_config=config.tools.exec,
+            cron_service=cron,
+            restrict_to_workspace=config.tools.restrict_to_workspace,
+            session_manager=session_manager,
+            mcp_servers=config.tools.mcp_servers,
+            channels_config=config.channels,
+        )
+
     # Set cron callback (needs agent)
     async def on_cron_job(job: CronJob) -> str | None:
         """Execute a cron job through the agent."""
@@ -339,7 +359,7 @@ def gateway(
             ))
         return response
     cron.on_job = on_cron_job
-    
+
     # Create channel manager
     channels = ChannelManager(config, bus)
 
@@ -390,35 +410,45 @@ def gateway(
         interval_s=30 * 60,  # 30 minutes
         enabled=True
     )
-    
+
     if channels.enabled_channels:
         console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
     else:
         console.print("[yellow]Warning: No channels enabled[/yellow]")
-    
+
     cron_status = cron.status()
     if cron_status["jobs"] > 0:
         console.print(f"[green]✓[/green] Cron: {cron_status['jobs']} scheduled jobs")
-    
+
     console.print(f"[green]✓[/green] Heartbeat: every 30m")
-    
+
     async def run():
         try:
             await cron.start()
             await heartbeat.start()
-            await asyncio.gather(
-                agent.run(),
-                channels.start_all(),
-            )
+            if swarm:
+                await asyncio.gather(
+                    swarm.run(),
+                    channels.start_all(),
+                )
+            else:
+                await asyncio.gather(
+                    agent.run(),
+                    channels.start_all(),
+                )
         except KeyboardInterrupt:
             console.print("\nShutting down...")
         finally:
-            await agent.close_mcp()
+            if swarm:
+                await swarm.close_mcp()
+                swarm.stop()
+            else:
+                await agent.close_mcp()
+                agent.stop()
             heartbeat.stop()
             cron.stop()
-            agent.stop()
             await channels.stop_all()
-    
+
     asyncio.run(run())
 
 
@@ -433,6 +463,7 @@ def gateway(
 def agent(
     message: str = typer.Option(None, "--message", "-m", help="Message to send to the agent"),
     session_id: str = typer.Option("cli:direct", "--session", "-s", help="Session ID"),
+    agent_name: str = typer.Option(None, "--agent", "-a", help="Target agent name (swarm mode)"),
     markdown: bool = typer.Option(True, "--markdown/--no-markdown", help="Render assistant output as Markdown"),
     logs: bool = typer.Option(False, "--logs/--no-logs", help="Show nanobot runtime logs during chat"),
 ):
@@ -442,9 +473,9 @@ def agent(
     from nanobot.agent.loop import AgentLoop
     from nanobot.cron.service import CronService
     from loguru import logger
-    
+
     config = load_config()
-    
+
     bus = MessageBus()
     provider = _make_provider(config)
 
@@ -456,23 +487,42 @@ def agent(
         logger.enable("nanobot")
     else:
         logger.disable("nanobot")
-    
-    agent_loop = AgentLoop(
-        bus=bus,
-        provider=provider,
-        workspace=config.workspace_path,
-        model=config.agents.defaults.model,
-        temperature=config.agents.defaults.temperature,
-        max_tokens=config.agents.defaults.max_tokens,
-        max_iterations=config.agents.defaults.max_tool_iterations,
-        memory_window=config.agents.defaults.memory_window,
-        brave_api_key=config.tools.web.search.api_key or None,
-        exec_config=config.tools.exec,
-        cron_service=cron,
-        restrict_to_workspace=config.tools.restrict_to_workspace,
-        mcp_servers=config.tools.mcp_servers,
-        channels_config=config.channels,
-    )
+
+    # Swarm mode: route to specific agent
+    if config.agents.instances and agent_name:
+        from nanobot.agent.swarm import SwarmManager
+        swarm = SwarmManager(
+            config=config,
+            shared_bus=bus,
+            provider=provider,
+            cron_service=cron,
+            mcp_servers=config.tools.mcp_servers,
+        )
+        target = swarm.get_agent(agent_name)
+        if target is None:
+            console.print(
+                f"[red]Agent '{agent_name}' not found.[/red] "
+                f"Available: {', '.join(swarm.agent_names)}"
+            )
+            raise typer.Exit(1)
+        agent_loop = target
+    else:
+        agent_loop = AgentLoop(
+            bus=bus,
+            provider=provider,
+            workspace=config.workspace_path,
+            model=config.agents.defaults.model,
+            temperature=config.agents.defaults.temperature,
+            max_tokens=config.agents.defaults.max_tokens,
+            max_iterations=config.agents.defaults.max_tool_iterations,
+            memory_window=config.agents.defaults.memory_window,
+            brave_api_key=config.tools.web.search.api_key or None,
+            exec_config=config.tools.exec,
+            cron_service=cron,
+            restrict_to_workspace=config.tools.restrict_to_workspace,
+            mcp_servers=config.tools.mcp_servers,
+            channels_config=config.channels,
+        )
     
     # Show spinner when logs are off (no output to miss); skip when logs are on
     def _thinking_ctx():
@@ -1032,6 +1082,48 @@ def status():
             else:
                 has_key = bool(p.api_key)
                 console.print(f"{spec.label}: {'[green]✓[/green]' if has_key else '[dim]not set[/dim]'}")
+
+
+# ============================================================================
+# Swarm Commands
+# ============================================================================
+
+
+swarm_app = typer.Typer(help="Manage the agent swarm")
+app.add_typer(swarm_app, name="swarm")
+
+
+@swarm_app.command("status")
+def swarm_status():
+    """Show swarm agent status."""
+    from nanobot.config.loader import load_config
+
+    config = load_config()
+
+    if not config.agents.instances:
+        console.print("[yellow]No swarm agents configured.[/yellow]")
+        console.print("Add agents to the [cyan]agents.instances[/cyan] list in config.json")
+        return
+
+    table = Table(title="Agent Swarm")
+    table.add_column("Agent", style="cyan")
+    table.add_column("Model")
+    table.add_column("Channels", style="green")
+    table.add_column("Workspace", style="dim")
+    table.add_column("Description")
+
+    defaults = config.agents.defaults
+    base_agents_dir = Path(defaults.workspace).expanduser().parent / "agents"
+
+    for idx, ac in enumerate(config.agents.instances):
+        name = ac.name or f"agent-{idx}"
+        model = ac.model or defaults.model
+        channels_str = ", ".join(ac.channels) if ac.channels else "[dim]fallback[/dim]"
+        ws = ac.workspace or str(base_agents_dir / name)
+        desc = ac.description or "[dim]-[/dim]"
+        table.add_row(name, model, channels_str, ws, desc)
+
+    console.print(table)
 
 
 # ============================================================================
